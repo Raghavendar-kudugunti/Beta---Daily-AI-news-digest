@@ -1,0 +1,9 @@
+﻿langchain-openai
+langgraph
+tavily-python
+feedparser
+requests
+pydantic
+python-dotenv
+fastapi
+uvicorn
