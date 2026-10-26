@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { decide, getConfig, getHistory, getHistoryRun, getState, startRun } from "./api";
-import type { Config, HistoryItem, RunEvent, RunResult, RunStatus, Story } from "./types";
+import type { Config, HistoryItem, RunEvent, RunMode, RunResult, RunStatus, Story } from "./types";
 import Pipeline from "./components/Pipeline";
 import Dashboard from "./components/Dashboard";
 import Logs from "./components/Logs";
@@ -33,6 +33,7 @@ export default function App() {
   const [result, setResult] = useState<RunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [requireHuman, setRequireHuman] = useState(true);
+  const [runMode, setRunMode] = useState<RunMode>("four_roles");
   const [feedback, setFeedback] = useState("");
   const [config, setConfig] = useState<Config | null>(null);
   const [prices, setPrices] = useState({ in: 0, out: 0 });
@@ -65,6 +66,7 @@ export default function App() {
         const s = await getState(next.current);
         next.current = s.next;
         setEvents((prev) => [...prev, ...s.events]);
+        setRunMode(s.run_mode);
         setStatus(s.status); setPending(s.pending); setResult(s.result); setError(s.error);
         if (s.status === "done" || s.status === "error") refreshHistory();
       } catch (e) { setError((e as Error).message); }
@@ -74,7 +76,7 @@ export default function App() {
 
   async function start() {
     setError(null); setResult(null); setEvents([]); setViewing(null); next.current = 0;
-    try { await startRun(requireHuman); setStatus("running"); } catch (e) { setError((e as Error).message); }
+    try { await startRun(requireHuman, runMode); setStatus("running"); } catch (e) { setError((e as Error).message); }
   }
 
   async function review(approve: boolean) {
@@ -83,7 +85,12 @@ export default function App() {
   }
 
   async function loadRun(name: string) {
-    try { setViewing({ name, events: await getHistoryRun(name) }); setTab("dashboard"); }
+    try {
+      const pastEvents = await getHistoryRun(name);
+      const mode = pastEvents.find((e) => e.event === "run_started")?.mode;
+      setRunMode(mode === "single_agent" ? "single_agent" : "four_roles");
+      setViewing({ name, events: pastEvents }); setTab("dashboard");
+    }
     catch (e) { setError((e as Error).message); }
   }
 
@@ -119,13 +126,23 @@ export default function App() {
 
       {tab === "run" && (
         <>
+          <div className="mode-picker" role="group" aria-label="Choose digest workflow">
+            <button className={`mode-option ${runMode === "single_agent" ? "selected" : ""}`} disabled={active}
+              onClick={() => setRunMode("single_agent")}>
+              <b>Day 1 · Single agent</b><small>One agent researches and selects the digest.</small>
+            </button>
+            <button className={`mode-option ${runMode === "four_roles" ? "selected" : ""}`} disabled={active}
+              onClick={() => setRunMode("four_roles")}>
+              <b>Day 2 · Four roles</b><small>Researcher, Drafter, Checker, and Reporter.</small>
+            </button>
+          </div>
           <div className="bar">
-            <button onClick={start} disabled={active}>{active ? "Running…" : "Run digest"}</button>
+            <button onClick={start} disabled={active}>{active ? "Running…" : runMode === "single_agent" ? "Run single-agent digest" : "Run four-role digest"}</button>
             <label><input type="checkbox" checked={requireHuman} disabled={active}
               onChange={(e) => setRequireHuman(e.target.checked)} /> Require my approval</label>
             <small className="muted">{active ? latest : ""}</small>
           </div>
-          <Pipeline events={events} status={status} requireHuman={requireHuman} />
+          <Pipeline events={events} status={status} requireHuman={requireHuman} mode={runMode} />
           {active && !pending && !result && <ol><li className="card skeleton" /><li className="card skeleton" /><li className="card skeleton" /></ol>}
 
           {pending && (
@@ -145,7 +162,7 @@ export default function App() {
 
           {result && (
             <section>
-              <h2>Digest <span className="status">{result.status}</span></h2>
+              <h2>Digest <span className="status">{result.run_mode === "single_agent" ? "Single agent" : "Four roles"} · {result.status}</span></h2>
               <ol>{result.picks.map((s, i) => <StoryCard key={s.url} story={s} n={i + 1} />)}</ol>
               <div className="bar"><button className="secondary" onClick={copyDigest}>{copied ? "Copied" : "Copy as Markdown"}</button></div>
               {result.rejection_log.length > 0 && (

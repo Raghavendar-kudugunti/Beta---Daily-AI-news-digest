@@ -9,7 +9,8 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
 }
 
 export const getState = (since: number) => call<Snapshot>(`/api/state?since=${since}`);
-export const startRun = (requireHuman: boolean) => call<{ ok: boolean }>("/api/runs", { require_human: requireHuman });
+export const startRun = (requireHuman: boolean, mode: "single_agent" | "four_roles") =>
+  call<{ ok: boolean }>("/api/runs", { require_human: requireHuman, mode });
 export const decide = (approve: boolean, feedback: string) => call<{ ok: boolean }>("/api/decision", { approve, feedback });
 export const getConfig = () => call<Config>("/api/config");
 export const getHistory = () => call<HistoryItem[]>("/api/history");

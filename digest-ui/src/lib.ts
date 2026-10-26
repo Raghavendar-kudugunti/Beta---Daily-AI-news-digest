@@ -14,6 +14,8 @@ export function describe(e: RunEvent): string {
     case "tool_call": return `Tool ${e.tool}: ${e.results} results`;
     case "tool_error": return `Tool error in ${e.tool}: ${e.error}`;
     case "researcher_done": return `Researcher done: ${e.candidates} candidates, ${e.eligible} eligible`;
+    case "single_agent_done": return `Single agent chose ${e.picks} of ${e.pool} eligible stories`;
+    case "run_started": return `Started ${e.mode === "single_agent" ? "single-agent" : "four-role"} run`;
     case "drafter_done": return `Drafter chose ${e.picks} of ${e.pool} eligible stories`;
     case "checker_done": return e.passed ? "Checker: PASS" : `Checker: REJECT (${e.issues} issues, ${e.valid_candidates} valid candidates left)`;
     case "rate_limited": return `Rate limited in ${e.step}; waiting ${e.wait_s}s`;

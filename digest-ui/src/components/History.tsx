@@ -10,10 +10,10 @@ export default function History({ items, current, onLoad, onRefresh }: Props) {
         <small className="muted">Past runs are read from the logs folder.</small></div>
       {items.length === 0 && <p className="empty">No saved runs yet.</p>}
       <table>
-        <thead><tr><th>Started</th><th>Status</th><th>Calls</th><th>Tokens</th><th>Model time</th><th /></tr></thead>
+        <thead><tr><th>Started</th><th>Mode</th><th>Status</th><th>Calls</th><th>Tokens</th><th>Model time</th><th /></tr></thead>
         <tbody>{items.map((r) => (
           <tr key={r.name} className={current === r.name ? "sel" : ""}>
-            <td>{r.started.replace("T", " ").slice(0, 19)}</td><td>{r.status}</td><td>{r.calls}</td>
+            <td>{r.started.replace("T", " ").slice(0, 19)}</td><td>{r.mode === "single_agent" ? "Single agent" : "Four roles"}</td><td>{r.status}</td><td>{r.calls}</td>
             <td>{fmt(r.input_tokens + r.output_tokens)}</td><td>{r.latency_s}s</td>
             <td><button className="secondary" onClick={() => onLoad(r.name)}>View</button></td>
           </tr>
