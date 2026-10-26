@@ -12,16 +12,19 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Literal
 
 import main as m
 
 app = FastAPI()
-STATE: dict = {"status": "idle", "error": None, "pending": None, "result": None, "decision": None}
+STATE: dict = {"status": "idle", "error": None, "pending": None, "result": None, "decision": None,
+              "run_mode": "four_roles"}
 DECIDED = threading.Event()
 
 
 class RunReq(BaseModel):
     require_human: bool = True
+    mode: Literal["single_agent", "four_roles"] = "four_roles"
 
 
 class DecisionReq(BaseModel):
@@ -38,18 +41,22 @@ def human_hook(picks):
     return d["approve"], d["feedback"]
 
 
-def worker(require_human: bool):
+def worker(require_human: bool, mode: str):
     try:
         m.init_run()
+        m.log_event("run_started", mode=mode)
         m.REQUIRE_HUMAN = require_human
         m.HUMAN_HOOK = human_hook if require_human else None
-        final = m.build_graph().invoke(
-            {"candidates": [], "rejected_urls": [], "check_failures": 0, "human_rounds": 0},
+        graph = m.build_single_agent_graph() if mode == "single_agent" else m.build_graph()
+        initial = {"candidates": [], "rejected_urls": [], "check_failures": 0, "human_rounds": 0,
+                   "run_mode": mode}
+        final = graph.invoke(
+            initial,
             config={"configurable": {"thread_id": "ui"}, "recursion_limit": 60})
         STATE.update(status="done", result={
             "status": final.get("status", ""), "picks": final.get("picks", []),
             "rejection_log": final.get("rejection_log", []), "doubts": final.get("doubts", []),
-            "report": Path(final["report_path"]).read_text(encoding="utf-8")})
+            "report": Path(final["report_path"]).read_text(encoding="utf-8"), "run_mode": mode})
     except Exception as e:  # noqa: BLE001
         STATE.update(status="error", error=str(e)[:400])
 
@@ -59,17 +66,17 @@ def start(req: RunReq):
     if STATE["status"] in ("running", "awaiting_review"):
         raise HTTPException(409, "A run is already in progress")
     try:
-        m.require_config()
+        m.require_config(require_checker=req.mode != "single_agent")
     except RuntimeError as e:
         raise HTTPException(400, str(e))
-    STATE.update(status="running", error=None, pending=None, result=None)
-    threading.Thread(target=worker, args=(req.require_human,), daemon=True).start()
+    STATE.update(status="running", error=None, pending=None, result=None, run_mode=req.mode)
+    threading.Thread(target=worker, args=(req.require_human, req.mode), daemon=True).start()
     return {"ok": True}
 
 
 @app.get("/api/state")
 def state(since: int = 0):
-    return {**{k: STATE[k] for k in ("status", "error", "pending", "result")},
+    return {**{k: STATE[k] for k in ("status", "error", "pending", "result", "run_mode")},
             "events": m.RUN_LOG[since:], "next": len(m.RUN_LOG)}
 
 
@@ -109,8 +116,10 @@ def history():
         ev = read_events(f)
         calls = [e for e in ev if e["event"] == "llm_call"]
         done = next((e for e in ev if e["event"] == "run_done"), None)
+        started = next((e for e in ev if e["event"] == "run_started"), {})
         items.append({"name": f.stem, "started": ev[0]["ts"] if ev else "", "events": len(ev),
-                      "status": done["status"] if done else "incomplete", "calls": len(calls),
+                      "status": done["status"] if done else "incomplete", "mode": started.get("mode", "four_roles"),
+                      "calls": len(calls),
                       "input_tokens": sum(e.get("input_tokens", 0) for e in calls),
                       "output_tokens": sum(e.get("output_tokens", 0) for e in calls),
                       "latency_s": round(sum(e.get("latency_s", 0) for e in calls), 1)})

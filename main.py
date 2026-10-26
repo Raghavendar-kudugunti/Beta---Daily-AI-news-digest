@@ -15,7 +15,8 @@ Run:
   export TAVILY_API_KEY=...            # or USE_AGENT_SEARCH=0 to skip web search
   python main.py                       # full pipeline with human approval
   python main.py --no-human            # full pipeline, no input() prompt (for scoring runs)
-  python main.py --baseline            # Day 1: researcher + one drafter call, no checker
+  python main.py --single-agent        # Day 1: one end-to-end agent, human approval by default
+  python main.py --baseline            # alias for --single-agent
   python main.py --test-checker        # planted-error tests, no LLM or network needed
 
 Useful env vars:
@@ -76,9 +77,11 @@ CHECKER_MODEL = CHECKER_CFG["model"]
 HUMAN_HOOK = None  # set by server.py so the web UI can approve picks instead of input()
 
 
-def require_config() -> None:
-    missing = [n for n, v in [("MAIN_API_KEY", MAIN_CFG["api_key"]), ("CHECKER_API_KEY", CHECKER_CFG["api_key"]),
-                              ("CHECKER_MODEL", CHECKER_CFG["model"])] if not v]
+def require_config(require_checker: bool = True) -> None:
+    required = [("MAIN_API_KEY", MAIN_CFG["api_key"])]
+    if require_checker:
+        required.extend([("CHECKER_API_KEY", CHECKER_CFG["api_key"]), ("CHECKER_MODEL", CHECKER_CFG["model"])])
+    missing = [n for n, v in required if not v]
     if missing:
         raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
@@ -419,6 +422,7 @@ class AgentState(TypedDict, total=False):
     doubts: Annotated[list[str], operator.add]
     status: str
     report_path: str
+    run_mode: Literal["single_agent", "four_roles"]
 
 
 # ----------------------------------------------------------------------------
@@ -475,6 +479,98 @@ def drafter_node(state: AgentState):
             picks.append({**c, "why_it_matters": p.why_it_matters.strip()[:240]})
     log_event("drafter_done", picks=len(picks), pool=len(pool))
     return {"picks": picks}
+
+
+def single_agent_prompt(pool: list[dict], feedback: str) -> str:
+    now = datetime.now(timezone.utc)
+    listing = "\n".join(
+        f"{i}. {c['title']} | {c['source']} | {age_hours(c['published'], now):.0f}h ago | {c['snippet'][:160]}"
+        for i, c in enumerate(pool, 1)
+    ) or "No candidates found yet. Use search tools if available."
+    return (
+        "You are one autonomous researcher and editor for a daily AI news digest for ML engineers and AI product builders. "
+        "Review the candidate evidence, identify the five most consequential eligible stories, and choose only candidates "
+        "from the latest numbered candidate list. Prefer major model or product releases, research results, and funding, "
+        "regulation, or infrastructure moves with real consequences. Avoid marketing, tutorials, opinion, and multiple "
+        "stories about one event. Use only evidence shown here; do not invent dates, URLs, or facts. For each pick, write "
+        "one sentence on why it matters. Return up to five unique candidate numbers. If search tools are available, use "
+        "them when the current candidates have important gaps, then choose from the updated candidate list. "
+        "Reply with only a JSON object matching this schema, and no prose or code fences:\n"
+        f"{json.dumps(DraftOut.model_json_schema())}\n\n"
+        f"Latest candidates:\n{listing}\n\n"
+        f"Human feedback from a previous draft: {feedback or 'none'}"
+    )
+
+
+def single_agent_draft(state: AgentState, candidates: list[dict]) -> tuple[Optional[DraftOut], list[dict]]:
+    """One tool-using agent researches and selects in a single conversation."""
+    tools = list(TOOL_FUNCS.values()) if USE_AGENT_SEARCH else []
+    model = llm.bind_tools(tools) if tools else llm
+    pool = eligible_candidates(candidates, state.get("rejected_urls", []))[:MAX_DRAFT_CANDIDATES]
+    messages = [
+        SystemMessage(content="Complete the full daily digest task yourself. Search tools, when available, are your tools; "
+                              "there are no separate researcher, drafter, or checker agents in this run."),
+        HumanMessage(content=single_agent_prompt(pool, state.get("feedback", ""))),
+    ]
+    tool_count = 0
+    parse_error = ""
+    for _ in range(MAX_TOOL_CALLS + 3):
+        response = call_llm("single_agent", model, messages, MODEL)
+        messages.append(response)
+        if response.tool_calls:
+            for tc in response.tool_calls:
+                fn = TOOL_FUNCS.get(tc["name"])
+                if fn is None or tool_count >= MAX_TOOL_CALLS:
+                    messages.append(ToolMessage(content="Tool unavailable or search budget exhausted.", tool_call_id=tc["id"]))
+                    continue
+                tool_count += 1
+                try:
+                    found = fn(**tc["args"])
+                except TypeError as e:
+                    found = []
+                    log_event("tool_error", tool=tc["name"], error=str(e)[:160])
+                candidates = merge_candidates(candidates, found)
+                log_event("tool_call", tool=tc["name"], args=tc["args"], results=len(found), mode="single_agent")
+                messages.append(ToolMessage(
+                    content=json.dumps([{"title": c["title"], "url": c["url"], "published": c["published"],
+                                         "source": c["source"], "snippet": c["snippet"]} for c in found], ensure_ascii=False),
+                    tool_call_id=tc["id"]))
+            pool = eligible_candidates(candidates, state.get("rejected_urls", []))[:MAX_DRAFT_CANDIDATES]
+            messages.append(HumanMessage(content="Updated complete candidate list. Use these current numbers in your final JSON:\n\n" +
+                                         single_agent_prompt(pool, state.get("feedback", ""))))
+            continue
+        raw = response.content if isinstance(response.content, str) else str(response.content)
+        try:
+            match = re.search(r"\{.*\}", raw, re.S)
+            return DraftOut.model_validate_json(match.group(0)), candidates
+        except Exception as e:  # noqa: BLE001
+            parse_error = str(e)[:160].replace("\n", " ")
+            messages.append(HumanMessage(content=f"Your response was not valid JSON for the requested schema ({parse_error}). Return valid JSON only."))
+    log_event("parse_fail", step="single_agent", error=parse_error or "search/tool budget exhausted before a final answer")
+    return None, candidates
+
+
+def single_agent_node(state: AgentState):
+    """Day 1 path: one agent gathers tool-backed candidates and selects the digest."""
+    print("\n[Node] Single agent: researching and selecting the digest...")
+    candidates = list(state.get("candidates", []))
+    if not candidates:
+        candidates = merge_candidates(candidates, pull_feeds())
+        candidates = merge_candidates(candidates, pull_hn())
+    eligible = eligible_candidates(candidates, state.get("rejected_urls", []))
+    log_event("researcher_done", candidates=len(candidates), eligible=len(eligible))
+
+    out, candidates = single_agent_draft(state, candidates)
+    pool = eligible_candidates(candidates, state.get("rejected_urls", []))[:MAX_DRAFT_CANDIDATES]
+    picks, used = [], set()
+    for p in (out.picks if out else []):
+        if 1 <= p.id <= len(pool) and p.id not in used and len(picks) < TOP_N:
+            used.add(p.id)
+            c = pool[p.id - 1]
+            picks.append({**c, "why_it_matters": p.why_it_matters.strip()[:240]})
+    log_event("single_agent_done", picks=len(picks), pool=len(pool))
+    # The Day 1 baseline has no automated checker. A human review remains available in the UI.
+    return {"candidates": candidates, "picks": picks, "run_mode": "single_agent"}
 
 
 def check_link(url: str) -> tuple[str, str]:
@@ -643,6 +739,12 @@ def token_summary() -> tuple[list[str], float]:
 
 
 def decide_status(state: AgentState) -> str:
+    if state.get("run_mode") == "single_agent":
+        if state.get("human_decision") == "Accept":
+            return "APPROVED_BY_HUMAN"
+        if state.get("human_decision") == "Reject":
+            return "REJECTED_BY_HUMAN"
+        return "SINGLE_AGENT_NO_HUMAN_REVIEW"
     if not state.get("verdict", {}).get("pass"):
         return f"CHECK_FAILED (gave up after {state.get('check_failures', 0)} failed checks)"
     if REQUIRE_HUMAN:
@@ -666,19 +768,26 @@ def reporter_node(state: AgentState):
     doubts += [f"Model output could not be parsed in step '{e['step']}'." for e in RUN_LOG if e["event"] == "parse_fail"]
     table, cost = token_summary()
 
-    L = [f"# AI News Digest - {datetime.now().strftime('%Y-%m-%d')}", "", f"**Status:** {status}", "",
+    mode = state.get("run_mode", "four_roles")
+    mode_label = "Single agent (Day 1 baseline)" if mode == "single_agent" else "Four roles (Day 2)"
+    L = [f"# AI News Digest - {datetime.now().strftime('%Y-%m-%d')}", "", f"**Status:** {status}",
+         f"**Run mode:** {mode_label}", "",
          "## Top picks", ""]
     for i, p in enumerate(picks, 1):
         L += [f"{i}. [{p['title']}]({p['url']}) ({p['source']}, {p['published']})",
               f"   - Why it matters: {p['why_it_matters']}"]
     L += ["", "## Run report", "",
+          f"- Run mode: {mode_label}",
           f"- Wall time: {time.time() - _run_start:.0f}s",
           f"- Candidates collected: {len(state.get('candidates', []))}",
           f"- Failed checks: {state.get('check_failures', 0)}, human rounds: {state.get('human_rounds', 0)}",
-          "", "### Checker rejections", ""]
+          "", "### Automated checker", ""]
     log = state.get("rejection_log", [])
-    L += [f"- Attempt {r['attempt']}: pick {i['pick']} - {i['type']} ({i['detail']})" for r in log for i in r["issues"]] \
-        or ["- none"]
+    if mode == "single_agent":
+        L.append("- Not run in the Day 1 single-agent baseline.")
+    else:
+        L += [f"- Attempt {r['attempt']}: pick {i['pick']} - {i['type']} ({i['detail']})" for r in log for i in r["issues"]] \
+            or ["- none"]
     L += ["", "### Tokens and cost", ""] + table + ["", f"Estimated cost: ${cost:.4f} "
           "(0 for a local model unless PRICE_IN_PER_M / PRICE_OUT_PER_M are set)", "", "### Open doubts", ""]
     L += [f"- {d}" for d in doubts] or ["- none"]
@@ -687,7 +796,7 @@ def reporter_node(state: AgentState):
     Path("reports").mkdir(exist_ok=True)
     path = Path("reports") / f"digest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     path.write_text(text, encoding="utf-8")
-    save_picks(picks, "full")
+    save_picks(picks, "single" if mode == "single_agent" else "full")
     log_event("run_done", status=status, report=str(path))
     print(text)
     return {"status": status, "report_path": str(path)}
@@ -726,6 +835,31 @@ def build_graph():
     g.add_conditional_edges("checker", route_after_checker,
                             {"human": "human", "reporter": "reporter", "researcher": "researcher", "drafter": "drafter"})
     g.add_conditional_edges("human", route_after_human, {"drafter": "drafter", "reporter": "reporter"})
+    g.add_edge("reporter", END)
+    return g.compile(checkpointer=MemorySaver())
+
+
+def route_after_single_agent(state: AgentState) -> str:
+    return "human" if REQUIRE_HUMAN else "reporter"
+
+
+def route_after_single_human(state: AgentState) -> str:
+    if state.get("human_decision") == "Reject" and state.get("human_rounds", 0) < MAX_HUMAN_ROUNDS:
+        return "single_agent"
+    return "reporter"
+
+
+def build_single_agent_graph():
+    """Day 1 end-to-end agent, with optional human approval and the shared reporter."""
+    g = StateGraph(AgentState)
+    g.add_node("single_agent", single_agent_node)
+    g.add_node("human", human_node)
+    g.add_node("reporter", reporter_node)
+    g.add_edge(START, "single_agent")
+    g.add_conditional_edges("single_agent", route_after_single_agent,
+                            {"human": "human", "reporter": "reporter"})
+    g.add_conditional_edges("human", route_after_single_human,
+                            {"single_agent": "single_agent", "reporter": "reporter"})
     g.add_edge("reporter", END)
     return g.compile(checkpointer=MemorySaver())
 
@@ -772,23 +906,12 @@ def run_checker_tests() -> int:
 # ----------------------------------------------------------------------------
 # 10. ENTRY POINT
 # ----------------------------------------------------------------------------
-def run_baseline() -> None:
-    """Day 1 baseline: researcher plus ONE drafter call. No checker, no loops. Score this first."""
-    init_run()
-    candidates = merge_candidates(merge_candidates([], pull_feeds()), pull_hn())
-    if USE_AGENT_SEARCH:
-        candidates = merge_candidates(candidates, agent_search({}, candidates))
-    picks = drafter_node({"candidates": candidates, "rejected_urls": [], "picks": [], "feedback": ""})["picks"]
-    for i, p in enumerate(picks, 1):
-        print(f"{i}. {p['title']}\n   {p['url']}\n   {p['why_it_matters']}")
-    print(f"\nSaved: {save_picks(picks, 'baseline')}")
-
-
 def main() -> None:
     global REQUIRE_HUMAN
     ap = argparse.ArgumentParser()
     ap.add_argument("--test-checker", action="store_true", help="run planted-error tests (offline)")
-    ap.add_argument("--baseline", action="store_true", help="Day 1 baseline without the checker")
+    ap.add_argument("--baseline", action="store_true", help="alias for --single-agent")
+    ap.add_argument("--single-agent", action="store_true", help="run the end-to-end single-agent Day 1 workflow")
     ap.add_argument("--no-human", action="store_true", help="skip the input() approval step")
     args = ap.parse_args()
 
@@ -796,18 +919,24 @@ def main() -> None:
         sys.exit(run_checker_tests())
     if args.no_human:
         REQUIRE_HUMAN = False
+    if args.baseline:
+        args.single_agent = True
     try:
-        require_config()
+        require_config(require_checker=not args.single_agent)
     except RuntimeError as e:
         sys.exit(str(e))
     if USE_AGENT_SEARCH and not os.environ.get("TAVILY_API_KEY"):
         sys.exit("TAVILY_API_KEY is not set. Set it, or run with USE_AGENT_SEARCH=0 to skip web search.")
 
-    if args.baseline:
-        run_baseline()
-        return
-
     init_run()
+    if args.single_agent:
+        log_event("run_started", mode="single_agent")
+        final = build_single_agent_graph().invoke(
+            {"candidates": [], "rejected_urls": [], "human_rounds": 0, "run_mode": "single_agent"},
+            config={"configurable": {"thread_id": f"digest_single_{int(time.time())}"}, "recursion_limit": 60})
+        print(f"\nSINGLE-AGENT RUN COMPLETE: {final.get('status')}\nReport: {final.get('report_path')}")
+        return
+    log_event("run_started", mode="four_roles")
     app = build_graph()
     config = {"configurable": {"thread_id": f"digest_{int(time.time())}"}, "recursion_limit": 60}
     final = app.invoke({"candidates": [], "rejected_urls": [], "check_failures": 0, "human_rounds": 0}, config=config)
