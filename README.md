@@ -103,7 +103,7 @@ The benchmark uses Python's standard library to read the workbook; it does not r
 ## Defaults and limits
 
 - The researcher reads seven configured RSS feeds and Hacker News, using a 48-hour candidate window.
-- Picks must be within the last 24 hours. The digest target is five stories; the drafter sees at most 30 eligible candidates.
+- Picks must be within the last 24 hours. The digest target is five stories; the drafter sees at most 30 eligible candidates balanced across publishers. When at least three publishers have eligible stories, the drafter aims to include at least three; the four-role checker sends a more concentrated draft back for revision.
 - Search tool calls are capped at five per research/tool loop. Checker failures and human revision rounds are bounded.
 - Link checks may be inconclusive when a source blocks automated requests; those cases are reported as doubts.
 - Run logs are JSONL under `logs/`. Digest Markdown, picked-story JSON, and benchmark reports are written under `reports/`. Both directories are Git-ignored.

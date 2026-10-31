@@ -86,6 +86,7 @@ def require_config(require_checker: bool = True) -> None:
         raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
 TOP_N = 5
+MIN_SOURCE_DIVERSITY = 3       # target distinct publishers when enough eligible sources exist
 FRESH_HOURS = 24               # a pick must be newer than this
 CANDIDATE_WINDOW_HOURS = 48    # how far back feeds/HN are pulled
 MAX_PER_FEED = 8
@@ -230,6 +231,21 @@ def similar_titles(a: str, b: str, threshold: float = 0.85) -> bool:
     return difflib.SequenceMatcher(None, na, nb).ratio() >= threshold
 
 
+def source_key(candidate: dict) -> str:
+    """Map feed labels and matching search-result hosts to the same publisher."""
+    source = re.sub(r"\s+", " ", str(candidate.get("source", ""))).strip().lower()
+    known_feeds = [(name.lower(), urlparse(url).netloc.lower().removeprefix("www."))
+                   for name, url in FEEDS]
+    for name, host in known_feeds:
+        if source == name:
+            return name
+    candidate_host = urlparse(candidate.get("url", "")).netloc.lower().removeprefix("www.")
+    for name, host in known_feeds:
+        if candidate_host == host or candidate_host.endswith("." + host) or host.endswith("." + candidate_host):
+            return name
+    return source or candidate_host
+
+
 def make_candidate(title, url, published, source, snippet="") -> dict:
     dt = parse_dt(published)
     return {
@@ -270,6 +286,30 @@ def eligible_candidates(candidates: list[dict], rejected_urls) -> list[dict]:
         if not any(similar_titles(c["title"], o["title"]) for o in out):
             out.append(c)
     return out
+
+
+def source_balanced_candidates(candidates: list[dict], limit: int = MAX_DRAFT_CANDIDATES) -> list[dict]:
+    """Keep candidates newest-first within each publisher, then rotate across publishers."""
+    by_source: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        by_source.setdefault(source_key(candidate), []).append(candidate)
+    balanced: list[dict] = []
+    sources = list(by_source)
+    while sources and len(balanced) < limit:
+        remaining = []
+        for source in sources:
+            items = by_source[source]
+            if items and len(balanced) < limit:
+                balanced.append(items.pop(0))
+            if items:
+                remaining.append(source)
+        sources = remaining
+    return balanced
+
+
+def source_diversity_target(candidates: list[dict]) -> int:
+    available = len({source_key(c) for c in candidates})
+    return min(MIN_SOURCE_DIVERSITY, TOP_N, available)
 
 
 # ----------------------------------------------------------------------------
@@ -453,7 +493,8 @@ class DraftOut(BaseModel):
 
 def drafter_node(state: AgentState):
     print("\n[Node] Drafter: choosing the top stories...")
-    pool = eligible_candidates(state["candidates"], state.get("rejected_urls", []))[:MAX_DRAFT_CANDIDATES]
+    eligible = eligible_candidates(state["candidates"], state.get("rejected_urls", []))
+    pool = source_balanced_candidates(eligible)
     now = datetime.now(timezone.utc)
     listing = "\n".join(
         f"{i}. {c['title']} | {c['source']} | {age_hours(c['published'], now):.0f}h ago | {c['snippet'][:160]}"
@@ -465,6 +506,8 @@ def drafter_node(state: AgentState):
         f"From the numbered candidates, choose the {TOP_N} stories that matter most today. Prefer major model or "
         "product releases, research results, and funding, regulation or infrastructure moves with real consequences. "
         "Avoid pure marketing, tutorials, opinion pieces, and two entries about the same event. "
+        f"Aim for at least {source_diversity_target(eligible)} distinct publishers when candidates allow; "
+        "do not let one publisher dominate just because it has more feed items. "
         "For each pick, write ONE sentence on why it matters.\n\n"
         f"Candidates:\n{listing}\n\n"
         f"Previous picks: {previous}\n"
@@ -477,7 +520,8 @@ def drafter_node(state: AgentState):
             used.add(p.id)
             c = pool[p.id - 1]
             picks.append({**c, "why_it_matters": p.why_it_matters.strip()[:240]})
-    log_event("drafter_done", picks=len(picks), pool=len(pool))
+    log_event("drafter_done", picks=len(picks), pool=len(pool),
+              pick_sources=sorted({source_key(p) for p in picks}))
     return {"picks": picks}
 
 
@@ -492,7 +536,9 @@ def single_agent_prompt(pool: list[dict], feedback: str) -> str:
         "Review the candidate evidence, identify the five most consequential eligible stories, and choose only candidates "
         "from the latest numbered candidate list. Prefer major model or product releases, research results, and funding, "
         "regulation, or infrastructure moves with real consequences. Avoid marketing, tutorials, opinion, and multiple "
-        "stories about one event. Use only evidence shown here; do not invent dates, URLs, or facts. For each pick, write "
+        "stories about one event. Aim for at least "
+        f"{source_diversity_target(pool)} distinct publishers when candidates allow; do not let one publisher dominate. "
+        "Use only evidence shown here; do not invent dates, URLs, or facts. For each pick, write "
         "one sentence on why it matters. Return up to five unique candidate numbers. If search tools are available, use "
         "them when the current candidates have important gaps, then choose from the updated candidate list. "
         "Reply with only a JSON object matching this schema, and no prose or code fences:\n"
@@ -506,7 +552,7 @@ def single_agent_draft(state: AgentState, candidates: list[dict]) -> tuple[Optio
     """One tool-using agent researches and selects in a single conversation."""
     tools = list(TOOL_FUNCS.values()) if USE_AGENT_SEARCH else []
     model = llm.bind_tools(tools) if tools else llm
-    pool = eligible_candidates(candidates, state.get("rejected_urls", []))[:MAX_DRAFT_CANDIDATES]
+    pool = source_balanced_candidates(eligible_candidates(candidates, state.get("rejected_urls", [])))
     messages = [
         SystemMessage(content="Complete the full daily digest task yourself. Search tools, when available, are your tools; "
                               "there are no separate researcher, drafter, or checker agents in this run."),
@@ -535,7 +581,7 @@ def single_agent_draft(state: AgentState, candidates: list[dict]) -> tuple[Optio
                     content=json.dumps([{"title": c["title"], "url": c["url"], "published": c["published"],
                                          "source": c["source"], "snippet": c["snippet"]} for c in found], ensure_ascii=False),
                     tool_call_id=tc["id"]))
-            pool = eligible_candidates(candidates, state.get("rejected_urls", []))[:MAX_DRAFT_CANDIDATES]
+            pool = source_balanced_candidates(eligible_candidates(candidates, state.get("rejected_urls", [])))
             messages.append(HumanMessage(content="Updated complete candidate list. Use these current numbers in your final JSON:\n\n" +
                                          single_agent_prompt(pool, state.get("feedback", ""))))
             continue
@@ -561,14 +607,15 @@ def single_agent_node(state: AgentState):
     log_event("researcher_done", candidates=len(candidates), eligible=len(eligible))
 
     out, candidates = single_agent_draft(state, candidates)
-    pool = eligible_candidates(candidates, state.get("rejected_urls", []))[:MAX_DRAFT_CANDIDATES]
+    pool = source_balanced_candidates(eligible_candidates(candidates, state.get("rejected_urls", [])))
     picks, used = [], set()
     for p in (out.picks if out else []):
         if 1 <= p.id <= len(pool) and p.id not in used and len(picks) < TOP_N:
             used.add(p.id)
             c = pool[p.id - 1]
             picks.append({**c, "why_it_matters": p.why_it_matters.strip()[:240]})
-    log_event("single_agent_done", picks=len(picks), pool=len(pool))
+    log_event("single_agent_done", picks=len(picks), pool=len(pool),
+              pick_sources=sorted({source_key(p) for p in picks}))
     # The Day 1 baseline has no automated checker. A human review remains available in the UI.
     return {"candidates": candidates, "picks": picks, "run_mode": "single_agent"}
 
@@ -599,6 +646,14 @@ def run_checks(picks: list[dict], candidates: list[dict], link_fn=check_link) ->
 
     if len(picks) != TOP_N:
         add(None, "count", f"expected {TOP_N} picks, got {len(picks)}")
+
+    available = eligible_candidates(candidates, [])
+    diversity_target = source_diversity_target(available)
+    picked_sources = {source_key(p) for p in picks}
+    if len(picks) == TOP_N and len(picked_sources) < diversity_target:
+        add(None, "source_concentration",
+            f"selected stories cover {len(picked_sources)} publishers; aim for {diversity_target} "
+            "distinct publishers when eligible alternatives exist")
 
     for i, p in enumerate(picks, 1):
         nu = normalize_url(p["url"])
