@@ -11,9 +11,5 @@ services:
         sync: false
       - key: CHECKER_API_KEY
         sync: false
-      - key: APP_PASSWORD
-        sync: false
-      - key: REQUIRE_APP_AUTH
-        value: "1"
       - key: USE_AGENT_SEARCH
         value: "0"

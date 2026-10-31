@@ -109,10 +109,10 @@ For a built UI, run `npm run build` inside `digest-ui`, then start the API. The 
 The repository includes a `render.yaml` Blueprint and a Dockerfile. Render builds the React UI and Python API into one web service, so the UI and API share one URL and no database is needed for the daily digest.
 
 1. Push the repository to GitHub and create a **New Blueprint** in Render, selecting this repository.
-2. Enter `MAIN_API_KEY` and `CHECKER_API_KEY` from your model providers, plus a strong, unique `APP_PASSWORD` for the site. Keep these values in Render's environment settings, never in Git.
-3. Deploy the Blueprint. Open its `onrender.com` URL; the browser will request the site password. Use any username and the `APP_PASSWORD` value. The password gate protects the UI and API from unauthorized runs that could use your model credits.
+2. Enter `MAIN_API_KEY` and `CHECKER_API_KEY` from your model providers in Render's environment settings. Keep these values out of Git.
+3. Deploy the Blueprint and open its `onrender.com` URL. The app is public and does not require a login.
 
-Web search is disabled in the Blueprint by default, so a Tavily key is not required. Set `USE_AGENT_SEARCH=1` and add `TAVILY_API_KEY` in Render if you want it enabled. Run logs and reports are stored as local files; on Render's default ephemeral filesystem, they can be lost when the service restarts or redeploys. You can add file persistence later without introducing a database.
+Because the app is public, anyone can start runs that use your configured model APIs and consume your credits. Web search is disabled in the Blueprint by default, so a Tavily key is not required. Set `USE_AGENT_SEARCH=1` and add `TAVILY_API_KEY` in Render if you want it enabled. Run logs and reports are stored as local files; on Render's default ephemeral filesystem, they can be lost when the service restarts or redeploys. You can add file persistence later without introducing a database.
 
 ## Test set and benchmark
 
