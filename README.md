@@ -2,6 +2,8 @@
 
 A LangGraph app that gathers recent AI news and prepares a five-story digest. Choose a **single-agent workflow** for a simple baseline or a **four-role workflow** for separate research, drafting, and checking steps. The React UI supports review, run history, and usage metrics.
 
+**Live demo:** [Open Daily AI News Digest](https://daily-ai-news-digest.onrender.com/)
+
 ## Workflows
 
 ### Day 1: single agent
