@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: daily-ai-news-digest
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: MAIN_API_KEY
+        sync: false
+      - key: CHECKER_API_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: REQUIRE_APP_AUTH
+        value: "1"
+      - key: USE_AGENT_SEARCH
+        value: "0"

@@ -1,6 +1,6 @@
 # Daily AI News Digest
 
-A LangGraph application that gathers recent AI news, selects five stories for a daily digest, and records each run. It has two workflows so you can compare a Day 1 single-agent baseline with the Day 2 four-role pipeline.
+A LangGraph app that gathers recent AI news and prepares a five-story digest. Choose a **single-agent workflow** for a simple baseline or a **four-role workflow** for separate research, drafting, and checking steps. The React UI supports review, run history, and usage metrics.
 
 ## Workflows
 
@@ -16,6 +16,28 @@ The single agent reviews the gathered candidates, can use search and feed tools 
 4. **Reporter** writes the digest, run summary, token use, estimated cost, rejections, and open doubts.
 
 Both workflows can pause for human approval. Nothing is published, posted, or emailed automatically.
+
+### Workflow at a glance
+
+```mermaid
+flowchart LR
+  subgraph single[Single-agent workflow]
+    S1[RSS feeds and Hacker News] --> S2[Agent researches and selects up to five stories]
+    S2 --> S3{Human review enabled?}
+    S3 -->|Approve or skip| S4[Reporter saves digest]
+    S3 -->|Request changes| S2
+  end
+
+  subgraph four[Four-role workflow]
+    R1[Researcher gathers candidates] --> R2[Drafter selects up to five]
+    R2 --> R3{Checker passes?}
+    R3 -->|No, enough candidates| R2
+    R3 -->|No, needs candidates| R1
+    R3 -->|Yes| R4{Human review enabled?}
+    R4 -->|Approve or skip| R5[Reporter saves digest]
+    R4 -->|Request changes| R2
+  end
+```
 
 ## Setup
 
@@ -66,6 +88,7 @@ python main.py --test-checker          # Offline deterministic checker tests
 Start the API from the repository root:
 
 ```powershell
+\.venv\Scripts\Activate.ps1
 uvicorn server:app --port 8000
 ```
 
@@ -77,9 +100,19 @@ npm install
 npm run dev
 ```
 
-Open the local Vite URL shown in the terminal (usually `http://localhost:5173`). The Run page lets you choose **Day 1 · Single agent** or **Day 2 · Four roles**, and whether to require approval. The Dashboard shows tokens, latency, estimated cost, checker results, source errors, and rate-limit waits. Logs and History retain prior run details.
+Open the local Vite URL shown in the terminal (usually `http://localhost:5173`). The Run page lets you choose **Day 1 - Single agent** or **Day 2 - Four roles**, and whether to require approval. The Dashboard shows tokens, latency, estimated cost, checker results, source errors, and rate-limit waits. Logs and History retain prior run details.
 
 For a built UI, run `npm run build` inside `digest-ui`, then start the API. The server serves `digest-ui/dist` when that directory exists.
+
+## Deploy on Render
+
+The repository includes a `render.yaml` Blueprint and a Dockerfile. Render builds the React UI and Python API into one web service, so the UI and API share one URL and no database is needed for the daily digest.
+
+1. Push the repository to GitHub and create a **New Blueprint** in Render, selecting this repository.
+2. Enter `MAIN_API_KEY` and `CHECKER_API_KEY` from your model providers, plus a strong, unique `APP_PASSWORD` for the site. Keep these values in Render's environment settings, never in Git.
+3. Deploy the Blueprint. Open its `onrender.com` URL; the browser will request the site password. Use any username and the `APP_PASSWORD` value. The password gate protects the UI and API from unauthorized runs that could use your model credits.
+
+Web search is disabled in the Blueprint by default, so a Tavily key is not required. Set `USE_AGENT_SEARCH=1` and add `TAVILY_API_KEY` in Render if you want it enabled. Run logs and reports are stored as local files; on Render's default ephemeral filesystem, they can be lost when the service restarts or redeploys. You can add file persistence later without introducing a database.
 
 ## Test set and benchmark
 

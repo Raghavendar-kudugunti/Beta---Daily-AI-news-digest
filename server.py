@@ -4,12 +4,17 @@
   uvicorn server:app --port 8000
 One run at a time (the run log is global). If digest-ui/dist exists it is served at /.
 """
+import base64
+import binascii
 import json
+import os
 import re
+import secrets
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Literal
@@ -17,9 +22,31 @@ from typing import Literal
 import main as m
 
 app = FastAPI()
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+REQUIRE_APP_AUTH = os.environ.get("REQUIRE_APP_AUTH", "").strip().lower() in ("1", "true", "yes", "y")
+if REQUIRE_APP_AUTH and not APP_PASSWORD:
+    raise RuntimeError("APP_PASSWORD must be set when REQUIRE_APP_AUTH=1")
+
 STATE: dict = {"status": "idle", "error": None, "pending": None, "result": None, "decision": None,
               "run_mode": "four_roles"}
 DECIDED = threading.Event()
+
+
+@app.middleware("http")
+async def password_gate(request: Request, call_next):
+    if not REQUIRE_APP_AUTH or request.url.path == "/healthz":
+        return await call_next(request)
+    header = request.headers.get("authorization", "")
+    try:
+        scheme, encoded = header.split(" ", 1)
+        credentials = base64.b64decode(encoded, validate=True).decode("utf-8")
+        _, password = credentials.split(":", 1)
+        authorized = scheme.lower() == "basic" and secrets.compare_digest(password, APP_PASSWORD)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        authorized = False
+    if not authorized:
+        return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Daily AI Digest"'})
+    return await call_next(request)
 
 
 class RunReq(BaseModel):
@@ -107,6 +134,11 @@ def config():
     return {"main_model": m.MAIN_CFG["model"], "checker_model": m.CHECKER_CFG["model"],
             "price_in": m.PRICE_IN_PER_M, "price_out": m.PRICE_OUT_PER_M, "require_human": m.REQUIRE_HUMAN,
             "agent_search": m.USE_AGENT_SEARCH, "llm_review": m.USE_LLM_REVIEW}
+
+
+@app.get("/healthz")
+def health():
+    return {"ok": True}
 
 
 @app.get("/api/history")

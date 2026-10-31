@@ -1,0 +1,9 @@
+.git
+.venv
+.env
+**/node_modules
+digest-ui/dist
+__pycache__
+*.pyc
+logs
+reports
